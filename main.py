@@ -191,6 +191,11 @@ def capture_access(response):
             record_access_log(response.status_code)
         except Exception:
             app.logger.exception("access log write failed")
+    # Admin pages are generated from the latest traffic data. Prevent a browser
+    # or reverse proxy from showing an older analytics layout after deployment.
+    if request.path.startswith("/admin/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
     return response
 
 def _age_request_allowed(ip: str):
@@ -1364,12 +1369,8 @@ def admin_analytics():
   </div>
 </div>
 <div class="grid-2 mb-4">
- <div class="card"><div class="card-header"><div class="card-title">年齢層</div></div><div style="height:280px"><canvas id="ageChart"></canvas></div></div>
+ <div class="card" id="age-distribution-card"><div class="card-header"><div class="card-title">年齢層</div></div><div style="height:280px"><canvas id="ageChart"></canvas></div></div>
  <div class="card"><div class="card-header"><div class="card-title">性別</div></div><div style="height:280px"><canvas id="genderChart"></canvas></div></div>
-</div>
-<div class="card mb-4">
-  <div class="card-header"><div class="card-title">年齢層</div></div>
-  <div style="height:280px"><canvas id="ageChart"></canvas></div>
 </div>
 <div class="card mb-4">
   <div class="card-header"><div class="card-title">14日間トレンド</div></div>
