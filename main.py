@@ -5,6 +5,9 @@ import json
 import base64
 import hashlib
 import functools
+import threading
+import time
+from html import escape
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -30,10 +33,25 @@ DATA_DIR     = "data"
 IPBANS_FILE  = os.path.join(DATA_DIR, "ipbans.json")
 TRAFFIC_FILE = os.path.join(DATA_DIR, "traffic.json")
 USERS_FILE   = os.path.join(DATA_DIR, "users.json")
+ACCESS_LOG_FILE = os.path.join(DATA_DIR, "access_logs.json")
+AGE_GUARD_FILE = os.path.join(DATA_DIR, "age_guard.json")
+CONFIG_FILE = "configs.json"
 IPINFO_TOKEN = ""
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(DATA_DIR,  exist_ok=True)
+
+DEFAULT_CONFIG = {
+    "edenai_api_key": "",
+    "edenai_provider": "amazon",
+    "age_detection_enabled": False,
+    "api_rate_limit_enabled": False,
+    "api_rate_limit_count": 10,
+    "api_rate_limit_unit": "second",
+}
+_file_lock = threading.RLock()
+_age_api_lock = threading.Lock()  # Eden AI calls are deliberately smoothed into a queue.
+_rate_timestamps = []
 
 # ── Cookie 設定 ───────────────────────────────────────────────────────────────
 AUTH_COOKIE   = "ag_auth"
@@ -53,17 +71,31 @@ detector = MTCNN(keep_all=True, device=device, thresholds=[0.6, 0.7, 0.7])
 #  JSON ユーティリティ
 # ══════════════════════════════════════════════════════════════════════════════
 def _load(path: str, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    with _file_lock:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
     return default
 
 def _save(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with _file_lock:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+def load_config() -> dict:
+    config = DEFAULT_CONFIG.copy()
+    stored = _load(CONFIG_FILE, {})
+    if isinstance(stored, dict):
+        config.update(stored)
+    return config
+
+def save_config(config: dict):
+    _save(CONFIG_FILE, {**DEFAULT_CONFIG, **config})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -130,17 +162,135 @@ def load_traffic() -> list:
 def save_traffic(traffic: list):
     _save(TRAFFIC_FILE, traffic)
 
-def record_traffic(ipv4, ipv6, ua, face_count, filename):
-    traffic = load_traffic()
-    traffic.append({
-        "ts":         datetime.now().isoformat(timespec="seconds"),
-        "ipv4":       ipv4,
-        "ipv6":       ipv6,
-        "ua":         ua,
-        "face_count": face_count,
-        "filename":   filename,
-    })
-    save_traffic(traffic[-5000:])
+def record_traffic(ipv4, ipv6, ua, face_count, filename, ages=None):
+    with _file_lock:
+        traffic = load_traffic()
+        traffic.append({
+            "ts":         datetime.now().isoformat(timespec="seconds"),
+            "ipv4":       ipv4,
+            "ipv6":       ipv6,
+            "ua":         ua,
+            "face_count": face_count,
+            "filename":   filename,
+            "ages":       ages or [],
+        })
+        save_traffic(traffic[-5000:])
+
+def load_access_logs() -> list:
+    return _load(ACCESS_LOG_FILE, [])
+
+def record_access_log(status: int):
+    """Store a compact request log for the admin live-terminal."""
+    ipv4, ipv6 = extract_ip_info(request)
+    with _file_lock:
+        logs = load_access_logs()
+        logs.append({
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "method": request.method,
+            "route": request.url_rule.rule if request.url_rule else "unmatched",
+            "path": request.full_path.rstrip("?"),
+            "ip": ipv4 if ipv4 != "不明" else ipv6,
+            "status": status,
+        })
+        _save(ACCESS_LOG_FILE, logs[-5000:])
+
+@app.after_request
+def capture_access(response):
+    # Polling the terminal itself would otherwise drown out useful application logs.
+    if request.path != "/admin/api/access-logs":
+        try:
+            record_access_log(response.status_code)
+        except Exception:
+            app.logger.exception("access log write failed")
+    return response
+
+def _age_request_allowed(ip: str):
+    """Allow three age checks per 30 seconds, then cool this IP down for one hour."""
+    now = time.time()
+    with _file_lock:
+        guard = _load(AGE_GUARD_FILE, {})
+        item = guard.get(ip, {})
+        blocked_until = float(item.get("blocked_until", 0))
+        if blocked_until > now:
+            return False, max(1, int(blocked_until - now))
+        recent = [float(t) for t in item.get("requests", []) if now - float(t) < 30]
+        if len(recent) >= 3:
+            guard[ip] = {"requests": [], "blocked_until": now + 3600}
+            _save(AGE_GUARD_FILE, guard)
+            return False, 3600
+        recent.append(now)
+        guard[ip] = {"requests": recent, "blocked_until": 0}
+        _save(AGE_GUARD_FILE, guard)
+        return True, 0
+
+def _rate_window_seconds(unit: str) -> int:
+    return {"second": 1, "hour": 3600, "day": 86400, "year": 31536000}.get(unit, 1)
+
+def _wait_for_api_slot(config: dict):
+    """Queue concurrent requests and pace them to the configured rolling-window limit."""
+    if not config.get("api_rate_limit_enabled"):
+        return
+    limit = max(1, int(config.get("api_rate_limit_count", 1)))
+    window = _rate_window_seconds(config.get("api_rate_limit_unit", "second"))
+    while True:
+        now = time.time()
+        _rate_timestamps[:] = [stamp for stamp in _rate_timestamps if now - stamp < window]
+        if len(_rate_timestamps) < limit:
+            _rate_timestamps.append(now)
+            return
+        time.sleep(min(max(_rate_timestamps[0] + window - now, 0.01), 1.0))
+
+def _extract_ages(payload) -> list:
+    """Accept Eden AI's provider response as well as normalized face lists."""
+    ages = []
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.lower() in ("age", "age_estimate", "estimated_age", "age_range"):
+                    if isinstance(child, dict):
+                        low = child.get("low", child.get("min"))
+                        high = child.get("high", child.get("max"))
+                        if "value" in child:
+                            child = child["value"]
+                        elif low is not None and high is not None:
+                            try:
+                                child = (float(low) + float(high)) / 2
+                            except (TypeError, ValueError):
+                                child = None
+                        else:
+                            child = low if low is not None else high
+                    try:
+                        age = int(round(float(child)))
+                        if 0 <= age <= 120:
+                            ages.append(age)
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(payload)
+    return ages
+
+def detect_ages(image_bytes: bytes, mimetype: str, ip: str):
+    config = load_config()
+    if not config.get("age_detection_enabled") or not config.get("edenai_api_key"):
+        return [], None
+    allowed, retry_after = _age_request_allowed(ip)
+    if not allowed:
+        return [], retry_after
+    with _age_api_lock:
+        _wait_for_api_slot(config)
+        response = requests.post(
+            "https://api.edenai.run/v2/image/face_detection",
+            headers={"Authorization": f"Bearer {config['edenai_api_key']}"},
+            data={"providers": config.get("edenai_provider", "amazon")},
+            files={"file": ("face.jpg", image_bytes, mimetype or "image/jpeg")},
+            timeout=30,
+        )
+    response.raise_for_status()
+    return _extract_ages(response.json()), None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -380,6 +530,10 @@ def _nav(page, uname, role):
 
     users_link = li("users", "アカウント管理",
         '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>') if is_adm else ""
+    live_link = li("live-logs", "ライブアクセスログ",
+        '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="m7 9 3 3-3 3m5 0h5"/></svg>') if is_adm else ""
+    settings_link = li("settings", "API 設定",
+        '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4"/></svg>') if is_adm else ""
 
     avatar = uname[0].upper()
     role_badge = f'<span class="badge {"badge-info" if is_adm else "badge-purple"}" style="font-size:9px;padding:2px 6px">{role}</span>'
@@ -404,6 +558,8 @@ def _nav(page, uname, role):
     {li("faces","顔写真ライブラリ",'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>')}
     {li("analytics","分析レポート",'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>')}
     {'<div class="nav-section">Admin</div>' if is_adm else ''}
+    {live_link}
+    {settings_link}
     {users_link}
   </nav>
   <div class="sidebar-user">
@@ -1056,12 +1212,14 @@ def admin_faces():
         except Exception:
             b64 = ""
             img_tag = '<div style="aspect-ratio:4/3;background:var(--bg3);display:flex;align-items:center;justify-content:center;color:var(--text3)">読込失敗</div>'
-        cards += f"""<div class="img-card" onclick="openModal('{fname}','{ip}','{ts}','{fc}',`{b64}`)">
+        delete_form = f'''<form method="post" action="/admin/faces/delete" onclick="event.stopPropagation()" style="margin-top:8px"><input type="hidden" name="filename" value="{escape(fname)}"><button class="btn btn-danger btn-sm" style="width:100%;justify-content:center" onclick="return confirm('この画像を削除しますか?')">画像を削除</button></form>''' if can_ban else ""
+        cards += f"""<div class="img-card" onclick="openModal('{escape(fname)}','{escape(ip)}','{escape(ts)}','{fc}',`{b64}`)">
           {img_tag}
           <div class="img-card-info">
             <div class="img-card-ip">{ip}</div>
             <div class="img-card-ts">{ts}</div>
             <div class="img-card-ts" style="color:var(--ok)">{fc}人</div>
+            {delete_form}
           </div>
         </div>"""
 
@@ -1124,6 +1282,23 @@ function banIp(){{
     return base_page(content, "faces", "顔写真ライブラリ")
 
 
+@app.route("/admin/faces/delete", methods=["POST"])
+@admin_only
+def admin_faces_delete():
+    filename = os.path.basename(request.form.get("filename", ""))
+    if not filename.lower().endswith(".jpg"):
+        return "不正なファイル名です", 400
+    path = os.path.join(SAVE_DIR, filename)
+    if os.path.isfile(path):
+        os.remove(path)
+    traffic = load_traffic()
+    for item in traffic:
+        if item.get("filename") == filename:
+            item["filename"] = None
+    save_traffic(traffic)
+    return redirect(request.referrer or "/admin/faces")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Admin: Analytics
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1136,6 +1311,7 @@ def admin_analytics():
     req_by_hour  = defaultdict(int)
     ua_counts    = defaultdict(int)
     daily        = defaultdict(int)
+    age_counts   = {"0–12": 0, "13–19": 0, "20–39": 0, "40–59": 0, "60+": 0}
     for t in traffic:
         ip = t.get("ipv4","不明")
         ip_counts[ip] += 1
@@ -1153,6 +1329,13 @@ def admin_analytics():
             ua_counts["Bot"] += 1
         else:
             ua_counts["デスクトップ"] += 1
+        for age in t.get("ages", []):
+            try:
+                age = int(age)
+                bucket = "0–12" if age <= 12 else "13–19" if age <= 19 else "20–39" if age <= 39 else "40–59" if age <= 59 else "60+"
+                age_counts[bucket] += 1
+            except (TypeError, ValueError):
+                pass
 
     top_ips     = sorted(ip_counts.items(), key=lambda x:x[1], reverse=True)[:8]
     hours       = [f"{i:02d}" for i in range(24)]
@@ -1205,6 +1388,10 @@ def admin_analytics():
   </div>
 </div>
 <div class="card mb-4">
+  <div class="card-header"><div class="card-title">年齢層（Eden AI 推定）</div><span class="badge badge-purple">閲覧者にも表示</span></div>
+  <div style="height:280px"><canvas id="ageChart"></canvas></div>
+</div>
+<div class="card mb-4">
   <div class="card-header"><div class="card-title">14日間トレンド</div></div>
   <div class="chart-container">
     <canvas id="lineChart"></canvas>
@@ -1224,9 +1411,93 @@ def admin_analytics():
 const GRID='rgba(255,255,255,.04)',TICK={{color:'#64748b',font:{{size:10}}}};
 new Chart(document.getElementById('hourChart'),{{type:'bar',data:{{labels:{json.dumps(hours)},datasets:[{{label:'リクエスト',data:{req_h_data},backgroundColor:'rgba(59,130,246,.5)',borderColor:'#3b82f6',borderWidth:1,borderRadius:3}},{{label:'顔検出',data:{face_h_data},backgroundColor:'rgba(16,185,129,.5)',borderColor:'#10b981',borderWidth:1,borderRadius:3}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{grid:{{color:GRID}},ticks:TICK}},y:{{grid:{{color:GRID}},ticks:TICK}}}}}}}});
 new Chart(document.getElementById('donutChart'),{{type:'doughnut',data:{{labels:{json.dumps(ua_labels)},datasets:[{{data:{json.dumps(ua_vals)},backgroundColor:{json.dumps(ua_colors[:len(ua_labels)])},borderWidth:0}}]}},options:{{responsive:false,plugins:{{legend:{{display:false}}}}}}}});
+new Chart(document.getElementById('ageChart'),{{type:'doughnut',data:{{labels:{json.dumps(list(age_counts.keys()))},datasets:[{{data:{json.dumps(list(age_counts.values()))},backgroundColor:['#22d3ee','#3b82f6','#6366f1','#f59e0b','#ef4444'],borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#94a3b8'}}}}}}}}}});
 new Chart(document.getElementById('lineChart'),{{type:'line',data:{{labels:{daily_labels},datasets:[{{label:'リクエスト',data:{daily_data},borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,.08)',borderWidth:2,fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#6366f1'}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{grid:{{color:GRID}},ticks:TICK}},y:{{grid:{{color:GRID}},ticks:TICK}}}}}}}});
 </script>"""
     return base_page(content, "analytics", "分析レポート")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Admin: Eden AI / rate limit settings
+# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/admin/settings", methods=["GET", "POST"])
+@admin_only
+def admin_settings():
+    config = load_config()
+    saved = False
+    if request.method == "POST":
+        key = request.form.get("edenai_api_key", "").strip()
+        # A blank key keeps the existing secret; the explicit button clears it.
+        if key:
+            config["edenai_api_key"] = key
+        if request.form.get("clear_api_key") == "1":
+            config["edenai_api_key"] = ""
+        config["edenai_provider"] = request.form.get("edenai_provider", "amazon").strip() or "amazon"
+        config["age_detection_enabled"] = request.form.get("age_detection_enabled") == "on"
+        config["api_rate_limit_enabled"] = request.form.get("api_rate_limit_enabled") == "on"
+        try:
+            config["api_rate_limit_count"] = max(1, int(request.form.get("api_rate_limit_count", 10)))
+        except ValueError:
+            config["api_rate_limit_count"] = 10
+        unit = request.form.get("api_rate_limit_unit", "second")
+        config["api_rate_limit_unit"] = unit if unit in ("second", "hour", "day", "year") else "second"
+        save_config(config)
+        saved = True
+
+    checked = lambda value: "checked" if value else ""
+    options = "".join(f'<option value="{unit}" {"selected" if config["api_rate_limit_unit"] == unit else ""}>{label}</option>' for unit, label in (("second", "秒"), ("hour", "時間"), ("day", "日"), ("year", "年")))
+    masked = "設定済み（末尾 " + escape(config["edenai_api_key"][-4:]) + "）" if config.get("edenai_api_key") else "未設定"
+    content = f"""
+<div class="topbar"><div><div class="page-title">API 設定</div><div class="page-sub">Eden AI 年齢判定と呼び出し速度を管理</div></div></div>
+{'<div class="alert alert-ok">設定を configs.json に保存しました</div>' if saved else ''}
+<form method="post"><div class="grid-2">
+ <div class="card"><div class="card-header"><div class="card-title">Eden AI 顔年齢判定</div></div>
+   <div class="form-group"><label class="form-label">API Key — {masked}</label><input class="input" type="password" name="edenai_api_key" autocomplete="new-password" placeholder="変更する場合のみ入力"></div>
+   <div class="form-group"><label class="form-label">Provider</label><input class="input" name="edenai_provider" value="{escape(str(config['edenai_provider']))}"></div>
+   <label class="form-label"><input type="checkbox" name="age_detection_enabled" {checked(config['age_detection_enabled'])}> 年齢判定を有効にする</label>
+   <label class="form-label" style="margin-top:12px"><input type="checkbox" name="clear_api_key" value="1"> 保存済み API Key を削除</label>
+ </div>
+ <div class="card"><div class="card-header"><div class="card-title">API レートリミット</div><span class="badge badge-warn">初期値: 無効</span></div>
+   <label class="form-label"><input type="checkbox" name="api_rate_limit_enabled" {checked(config['api_rate_limit_enabled'])}> レートリミットを有効にする</label>
+   <div class="grid-2 mt-4"><div class="form-group"><label class="form-label">回数</label><input class="input" type="number" min="1" name="api_rate_limit_count" value="{config['api_rate_limit_count']}"></div><div class="form-group"><label class="form-label">期間</label><select class="select" name="api_rate_limit_unit">{options}</select></div></div>
+   <p style="font-size:12px;color:var(--text3);margin-bottom:18px">同時アクセスはキューで直列化し、設定したローリング期間に合わせて Eden AI 呼び出しを調節します。同一 IP の年齢判定は30秒に3回まで、超過時は1時間停止します。</p>
+   <button class="btn btn-primary" type="submit">設定を保存</button>
+ </div>
+</div></form>"""
+    return base_page(content, "settings", "API 設定")
+
+
+@app.route("/admin/live-logs")
+@admin_only
+def admin_live_logs():
+    content = """
+<div class="topbar"><div><div class="page-title">ライブアクセスログ</div><div class="page-sub">ルート・IP・パス・レスポンスコードをリアルタイム表示</div></div><form method="post" action="/admin/logs/clear"><button class="btn btn-danger" onclick="return confirm('アクセスログを全件削除しますか?')">ログをクリア</button></form></div>
+<div class="card" style="padding:0;overflow:hidden;border-color:#334155">
+ <div style="height:42px;background:#161b22;display:flex;align-items:center;gap:7px;padding:0 14px;border-bottom:1px solid #30363d">
+  <svg width="54" height="14" viewBox="0 0 54 14" aria-label="terminal controls"><circle cx="7" cy="7" r="6" fill="#ff5f57"/><circle cx="27" cy="7" r="6" fill="#febc2e"/><circle cx="47" cy="7" r="6" fill="#28c840"/></svg>
+  <span style="font:12px var(--mono);color:#8b949e;margin-left:10px">faceguard — access.log — live</span><span class="badge badge-ok" style="margin-left:auto">● LIVE</span>
+ </div>
+ <pre id="terminal" style="height:620px;overflow:auto;background:#0d1117;padding:16px;color:#c9d1d9;font:12px/1.75 var(--mono);white-space:pre-wrap">接続中...</pre>
+</div>
+<script>
+let latest='';
+async function refreshLogs(){try{const r=await fetch('/admin/api/access-logs');if(!r.ok)return;const d=await r.json();const out=d.logs.map(x=>`${x.ts}  ${String(x.status).padEnd(3)}  ${x.method.padEnd(6)}  ${x.ip.padEnd(39)}  route=${x.route}  path=${x.path}`).join('\n');if(out!==latest){const el=document.getElementById('terminal');const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent=out||'アクセスログは空です';latest=out;if(bottom)el.scrollTop=el.scrollHeight;}}catch(e){}};
+refreshLogs();setInterval(refreshLogs,1500);
+</script>"""
+    return base_page(content, "live-logs", "ライブアクセスログ")
+
+
+@app.route("/admin/api/access-logs")
+@admin_only
+def admin_access_logs_api():
+    return jsonify({"logs": load_access_logs()[-300:]})
+
+
+@app.route("/admin/logs/clear", methods=["POST"])
+@admin_only
+def admin_logs_clear():
+    _save(ACCESS_LOG_FILE, [])
+    return redirect("/admin/live-logs")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1279,6 +1550,9 @@ def detect_human_face():
         face_count  = len(boxes) if boxes is not None else 0
         has_face    = face_count > 0
         filename    = None
+        ages        = []
+        age_retry_after = None
+        age_error   = None
 
         if has_face:
             now_str    = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1303,8 +1577,21 @@ def detect_human_face():
                 except Exception as e:
                     print(f"Discord error: {e}")
 
-        record_traffic(ipv4_addr, ipv6_addr, user_agent, face_count, filename)
-        return jsonify({"human_face":has_face,"face_count":face_count}), 200
+            try:
+                ages, age_retry_after = detect_ages(
+                    image_bytes, file.mimetype or "image/jpeg", target_ip
+                )
+            except requests.RequestException as e:
+                age_error = "年齢判定 API を利用できませんでした"
+                app.logger.warning("Eden AI request failed: %s", e)
+
+        record_traffic(ipv4_addr, ipv6_addr, user_agent, face_count, filename, ages)
+        result = {"human_face": has_face, "face_count": face_count, "ages": ages}
+        if age_retry_after is not None:
+            result.update({"age_rate_limited": True, "age_retry_after": age_retry_after})
+        if age_error:
+            result["age_error"] = age_error
+        return jsonify(result), 200
 
     except Exception as e:
         return jsonify({"error":str(e)}), 500
