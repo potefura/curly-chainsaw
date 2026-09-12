@@ -7,6 +7,7 @@ import hashlib
 import functools
 import threading
 import time
+import subprocess
 from html import escape
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -35,24 +36,12 @@ IPBANS_FILE  = os.path.join(DATA_DIR, "ipbans.json")
 TRAFFIC_FILE = os.path.join(DATA_DIR, "traffic.json")
 USERS_FILE   = os.path.join(DATA_DIR, "users.json")
 AGE_GUARD_FILE = os.path.join(DATA_DIR, "age_guard.json")
-CONFIG_FILE = "configs.json"
 IPINFO_TOKEN = ""
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(DATA_DIR,  exist_ok=True)
 
-DEFAULT_CONFIG = {
-    "edenai_api_key": "",
-    "edenai_provider": "facepp",
-    "age_detection_enabled": False,
-    "api_rate_limit_enabled": False,
-    "api_rate_limit_count": 10,
-    "api_rate_limit_unit": "second",
-}
 _file_lock = threading.RLock()
-_age_api_lock = threading.Lock()  # Eden AI calls are deliberately smoothed into a queue.
-_rate_timestamps = []
-_provider_rate_timestamps = []
 _access_logs = deque(maxlen=5000)
 
 class AgeDetectionError(Exception):
@@ -61,7 +50,7 @@ class AgeDetectionError(Exception):
     def __init__(self, status_code, detail):
         self.status_code = status_code
         self.detail = detail
-        super().__init__(f"Face++ returned HTTP {status_code}: {detail}")
+        super().__init__(f"Age detection failed ({status_code}): {detail}")
 
 # ── Cookie 設定 ───────────────────────────────────────────────────────────────
 AUTH_COOKIE   = "ag_auth"
@@ -96,20 +85,6 @@ def _save(path: str, data):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
-
-def load_config() -> dict:
-    config = DEFAULT_CONFIG.copy()
-    stored = _load(CONFIG_FILE, {})
-    if isinstance(stored, dict):
-        config.update(stored)
-    # This integration targets Face++; migrate configurations created with the
-    # former Amazon default without requiring an extra settings-page save.
-    config["edenai_provider"] = "facepp"
-    return config
-
-def save_config(config: dict):
-    _save(CONFIG_FILE, {**DEFAULT_CONFIG, **config})
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ユーザー管理
@@ -175,7 +150,7 @@ def load_traffic() -> list:
 def save_traffic(traffic: list):
     _save(TRAFFIC_FILE, traffic)
 
-def record_traffic(ipv4, ipv6, ua, face_count, filename, ages=None):
+def record_traffic(ipv4, ipv6, ua, face_count, filename, ages=None, genders=None):
     with _file_lock:
         traffic = load_traffic()
         traffic.append({
@@ -186,6 +161,7 @@ def record_traffic(ipv4, ipv6, ua, face_count, filename, ages=None):
             "face_count": face_count,
             "filename":   filename,
             "ages":       ages or [],
+            "genders":    genders or [],
         })
         save_traffic(traffic[-5000:])
 
@@ -236,106 +212,50 @@ def _age_request_allowed(ip: str):
         _save(AGE_GUARD_FILE, guard)
         return True, 0
 
-def _rate_window_seconds(unit: str) -> int:
-    return {"second": 1, "hour": 3600, "day": 86400, "year": 31536000}.get(unit, 1)
-
-def _wait_for_api_slot(config: dict):
-    """Enforce Face++'s 3 req/s ceiling plus an optional stricter admin limit."""
-    while True:
-        now = time.time()
-        _provider_rate_timestamps[:] = [stamp for stamp in _provider_rate_timestamps if now - stamp < 1]
-        provider_ready = len(_provider_rate_timestamps) < 3
-
-        custom_ready = True
-        custom_wait = 0
-        if config.get("api_rate_limit_enabled"):
-            limit = max(1, int(config.get("api_rate_limit_count", 1)))
-            window = _rate_window_seconds(config.get("api_rate_limit_unit", "second"))
-            _rate_timestamps[:] = [stamp for stamp in _rate_timestamps if now - stamp < window]
-            custom_ready = len(_rate_timestamps) < limit
-            if not custom_ready:
-                custom_wait = _rate_timestamps[0] + window - now
-
-        if provider_ready and custom_ready:
-            _provider_rate_timestamps.append(now)
-            if config.get("api_rate_limit_enabled"):
-                _rate_timestamps.append(now)
-            return
-
-        provider_wait = _provider_rate_timestamps[0] + 1 - now if not provider_ready else 0
-        time.sleep(min(max(provider_wait, custom_wait, 0.01), 1.0))
-
-def _extract_ages(payload) -> list:
-    """Accept Eden AI's provider response as well as normalized face lists."""
-    ages = []
-    def walk(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key.lower() in ("age", "age_estimate", "estimated_age", "age_range"):
-                    if isinstance(child, dict):
-                        low = child.get("low", child.get("min"))
-                        high = child.get("high", child.get("max"))
-                        if "value" in child:
-                            child = child["value"]
-                        elif low is not None and high is not None:
-                            try:
-                                child = (float(low) + float(high)) / 2
-                            except (TypeError, ValueError):
-                                child = None
-                        else:
-                            child = low if low is not None else high
-                    try:
-                        age = int(round(float(child)))
-                        if 0 <= age <= 120:
-                            ages.append(age)
-                    except (TypeError, ValueError):
-                        pass
-                else:
-                    walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-    walk(payload)
-    return ages
-
-def detect_ages(image_bytes: bytes, mimetype: str, ip: str):
-    config = load_config()
-    if not config.get("age_detection_enabled") or not config.get("edenai_api_key"):
-        return [], None
+def detect_demographics(image_path: str, ip: str):
+    """Run the local age.py helper and parse ``age,gender`` from its output."""
     allowed, retry_after = _age_request_allowed(ip)
     if not allowed:
-        return [], retry_after
-    # Always upload a real JPEG. Browser uploads can be PNG/WebP while carrying
-    # an inaccurate MIME type, which Face++ rejects with HTTP 400.
-    upload_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    upload_image.thumbnail((2048, 2048))
-    upload_buffer = io.BytesIO()
-    upload_image.save(upload_buffer, format="JPEG", quality=90)
-    with _age_api_lock:
-        _wait_for_api_slot(config)
-        response = requests.post(
-            "https://api.edenai.run/v2/image/face_detection",
-            headers={
-                "Authorization": f"Bearer {config['edenai_api_key']}",
-                "Accept": "application/json",
-            },
-            data={"providers": config.get("edenai_provider", "facepp")},
-            files={"file": ("face.jpg", upload_buffer.getvalue(), "image/jpeg")},
-            timeout=30,
-        )
-    if not response.ok:
+        return [], [], retry_after
+
+    script_path = os.environ.get("AGE_SCRIPT_PATH", "/root/age.py")
+    python_cmd = os.environ.get("AGE_PYTHON", "python3")
+    absolute_image_path = os.path.abspath(image_path)
+
+    for attempt in range(3):
         try:
-            error_payload = response.json()
-            detail = error_payload.get("detail", error_payload.get("error", error_payload))
-            detail = json.dumps(detail, ensure_ascii=False) if not isinstance(detail, str) else detail
-        except (ValueError, TypeError):
-            detail = response.text or response.reason
-        raise AgeDetectionError(response.status_code, str(detail)[:500])
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise AgeDetectionError(502, "年齢判定サービスから不正な応答が返されました") from exc
-    return _extract_ages(payload), None
+            completed = subprocess.run(
+                [python_cmd, script_path, absolute_image_path],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AgeDetectionError(502, f"age.py を実行できませんでした: {exc}") from exc
+
+        output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        output = output_lines[-1] if output_lines else ""
+        if output.lower() == "ratelimit":
+            if attempt < 2:
+                time.sleep(60)
+                continue
+            raise AgeDetectionError(429, "年齢判定が3回連続でレート制限されました")
+        if output == "失敗しました":
+            raise AgeDetectionError(502, "年齢判定に失敗しました")
+
+        match = re.fullmatch(r"(\d{1,3})\s*,\s*(male|female)", output, re.IGNORECASE)
+        if completed.returncode == 0 and match:
+            age = int(match.group(1))
+            if age > 120:
+                raise AgeDetectionError(502, "age.py が不正な年齢を返しました")
+            gender = "男性" if match.group(2).lower() == "male" else "女性"
+            return [age], [gender], None
+
+        error = completed.stderr.strip() or output or f"終了コード {completed.returncode}"
+        raise AgeDetectionError(502, f"age.py の応答が不正です: {error[:300]}")
+
+    raise AgeDetectionError(429, "年齢判定がレート制限されました")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -577,8 +497,6 @@ def _nav(page, uname, role):
         '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>') if is_adm else ""
     live_link = li("live-logs", "ライブアクセスログ",
         '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="m7 9 3 3-3 3m5 0h5"/></svg>') if is_adm else ""
-    settings_link = li("settings", "API 設定",
-        '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4"/></svg>') if is_adm else ""
 
     avatar = uname[0].upper()
     role_badge = f'<span class="badge {"badge-info" if is_adm else "badge-purple"}" style="font-size:9px;padding:2px 6px">{role}</span>'
@@ -604,7 +522,6 @@ def _nav(page, uname, role):
     {li("analytics","分析レポート",'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>')}
     {'<div class="nav-section">Admin</div>' if is_adm else ''}
     {live_link}
-    {settings_link}
     {users_link}
   </nav>
   <div class="sidebar-user">
@@ -1357,6 +1274,7 @@ def admin_analytics():
     ua_counts    = defaultdict(int)
     daily        = defaultdict(int)
     age_counts   = {"0–12": 0, "13–19": 0, "20–39": 0, "40–59": 0, "60+": 0}
+    gender_counts = {"男性": 0, "女性": 0}
     for t in traffic:
         ip = t.get("ipv4","不明")
         ip_counts[ip] += 1
@@ -1381,6 +1299,9 @@ def admin_analytics():
                 age_counts[bucket] += 1
             except (TypeError, ValueError):
                 pass
+        for gender in t.get("genders", []):
+            if gender in gender_counts:
+                gender_counts[gender] += 1
 
     top_ips     = sorted(ip_counts.items(), key=lambda x:x[1], reverse=True)[:8]
     hours       = [f"{i:02d}" for i in range(24)]
@@ -1397,6 +1318,11 @@ def admin_analytics():
     age_colors  = ["#22d3ee", "#3b82f6", "#6366f1", "#f59e0b", "#ef4444"]
     if not any(age_values):
         age_labels, age_values, age_colors = ["データなし"], [1], ["#252d45"]
+    gender_labels = list(gender_counts.keys())
+    gender_values = list(gender_counts.values())
+    gender_colors = ["#3b82f6", "#ec4899"]
+    if not any(gender_values):
+        gender_labels, gender_values, gender_colors = ["データなし"], [1], ["#252d45"]
 
     donut_items = ""
     total_ua = sum(ua_vals) or 1
@@ -1437,6 +1363,10 @@ def admin_analytics():
     </div>
   </div>
 </div>
+<div class="grid-2 mb-4">
+ <div class="card"><div class="card-header"><div class="card-title">年齢層</div></div><div style="height:280px"><canvas id="ageChart"></canvas></div></div>
+ <div class="card"><div class="card-header"><div class="card-title">性別</div></div><div style="height:280px"><canvas id="genderChart"></canvas></div></div>
+</div>
 <div class="card mb-4">
   <div class="card-header"><div class="card-title">年齢層</div></div>
   <div style="height:280px"><canvas id="ageChart"></canvas></div>
@@ -1462,62 +1392,15 @@ const GRID='rgba(255,255,255,.04)',TICK={{color:'#64748b',font:{{size:10}}}};
 new Chart(document.getElementById('hourChart'),{{type:'bar',data:{{labels:{json.dumps(hours)},datasets:[{{label:'リクエスト',data:{req_h_data},backgroundColor:'rgba(59,130,246,.5)',borderColor:'#3b82f6',borderWidth:1,borderRadius:3}},{{label:'顔検出',data:{face_h_data},backgroundColor:'rgba(16,185,129,.5)',borderColor:'#10b981',borderWidth:1,borderRadius:3}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{grid:{{color:GRID}},ticks:TICK}},y:{{grid:{{color:GRID}},ticks:TICK}}}}}}}});
 new Chart(document.getElementById('donutChart'),{{type:'doughnut',data:{{labels:{json.dumps(ua_labels)},datasets:[{{data:{json.dumps(ua_vals)},backgroundColor:{json.dumps(ua_colors[:len(ua_labels)])},borderWidth:0}}]}},options:{{responsive:false,plugins:{{legend:{{display:false}}}}}}}});
 new Chart(document.getElementById('ageChart'),{{type:'doughnut',data:{{labels:{json.dumps(age_labels)},datasets:[{{data:{json.dumps(age_values)},backgroundColor:{json.dumps(age_colors)},borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#94a3b8'}}}}}}}}}});
+new Chart(document.getElementById('genderChart'),{{type:'doughnut',data:{{labels:{json.dumps(gender_labels)},datasets:[{{data:{json.dumps(gender_values)},backgroundColor:{json.dumps(gender_colors)},borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#94a3b8'}}}}}}}}}});
 new Chart(document.getElementById('lineChart'),{{type:'line',data:{{labels:{daily_labels},datasets:[{{label:'リクエスト',data:{daily_data},borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,.08)',borderWidth:2,fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#6366f1'}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{grid:{{color:GRID}},ticks:TICK}},y:{{grid:{{color:GRID}},ticks:TICK}}}}}}}});
 </script>"""
     return base_page(content, "analytics", "分析レポート")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Admin: Eden AI / rate limit settings
+#  Admin: volatile live access logs
 # ══════════════════════════════════════════════════════════════════════════════
-@app.route("/admin/settings", methods=["GET", "POST"])
-@admin_only
-def admin_settings():
-    config = load_config()
-    saved = False
-    if request.method == "POST":
-        key = request.form.get("edenai_api_key", "").strip()
-        # A blank key keeps the existing secret; the explicit button clears it.
-        if key:
-            config["edenai_api_key"] = key
-        if request.form.get("clear_api_key") == "1":
-            config["edenai_api_key"] = ""
-        # Eden AI uses the provider slug "facepp" for Face++.
-        config["edenai_provider"] = "facepp"
-        config["age_detection_enabled"] = request.form.get("age_detection_enabled") == "on"
-        config["api_rate_limit_enabled"] = request.form.get("api_rate_limit_enabled") == "on"
-        try:
-            config["api_rate_limit_count"] = max(1, int(request.form.get("api_rate_limit_count", 10)))
-        except ValueError:
-            config["api_rate_limit_count"] = 10
-        unit = request.form.get("api_rate_limit_unit", "second")
-        config["api_rate_limit_unit"] = unit if unit in ("second", "hour", "day", "year") else "second"
-        save_config(config)
-        saved = True
-
-    checked = lambda value: "checked" if value else ""
-    options = "".join(f'<option value="{unit}" {"selected" if config["api_rate_limit_unit"] == unit else ""}>{label}</option>' for unit, label in (("second", "秒"), ("hour", "時間"), ("day", "日"), ("year", "年")))
-    masked = "設定済み（末尾 " + escape(config["edenai_api_key"][-4:]) + "）" if config.get("edenai_api_key") else "未設定"
-    content = f"""
-<div class="topbar"><div><div class="page-title">API 設定</div><div class="page-sub">年齢判定と呼び出し速度を管理</div></div></div>
-{'<div class="alert alert-ok">設定を configs.json に保存しました</div>' if saved else ''}
-<form method="post"><div class="grid-2">
- <div class="card"><div class="card-header"><div class="card-title">顔年齢判定</div></div>
-   <div class="form-group"><label class="form-label">API Key — {masked}</label><input class="input" type="password" name="edenai_api_key" autocomplete="new-password" placeholder="変更する場合のみ入力"></div>
-   <div class="form-group"><label class="form-label">Provider</label><input class="input" value="Face++ (facepp)" disabled><input type="hidden" name="edenai_provider" value="facepp"></div>
-   <label class="form-label"><input type="checkbox" name="age_detection_enabled" {checked(config['age_detection_enabled'])}> 年齢判定を有効にする</label>
-   <label class="form-label" style="margin-top:12px"><input type="checkbox" name="clear_api_key" value="1"> 保存済み API Key を削除</label>
- </div>
- <div class="card"><div class="card-header"><div class="card-title">API レートリミット</div><span class="badge badge-warn">初期値: 無効</span></div>
-   <label class="form-label"><input type="checkbox" name="api_rate_limit_enabled" {checked(config['api_rate_limit_enabled'])}> レートリミットを有効にする</label>
-   <div class="grid-2 mt-4"><div class="form-group"><label class="form-label">回数</label><input class="input" type="number" min="1" name="api_rate_limit_count" value="{config['api_rate_limit_count']}"></div><div class="form-group"><label class="form-label">期間</label><select class="select" name="api_rate_limit_unit">{options}</select></div></div>
-   <p style="font-size:12px;color:var(--text3);margin-bottom:18px">Face++ の上限に合わせて常に秒間3リクエスト以内に調節します。この設定を有効にすると、さらに厳しい独自上限を追加できます。同一 IP の年齢判定は30秒に3回まで、超過時は1時間停止します。</p>
-   <button class="btn btn-primary" type="submit">設定を保存</button>
- </div>
-</div></form>"""
-    return base_page(content, "settings", "API 設定")
-
-
 @app.route("/admin/live-logs")
 @admin_only
 def admin_live_logs():
@@ -1532,7 +1415,7 @@ def admin_live_logs():
 </div>
 <script>
 let latest='';
-async function refreshLogs(){const el=document.getElementById('terminal');try{const r=await fetch('/admin/api/access-logs',{cache:'no-store'});if(r.redirected){location.href=r.url;return;}if(!r.ok)throw new Error(`HTTP ${r.status}`);const d=await r.json();const out=d.logs.map(x=>`${x.ts}  ${String(x.status).padEnd(3)}  ${x.method.padEnd(6)}  ${x.ip.padEnd(39)}  route=${x.route}  path=${x.path}`).join('\\n');if(out!==latest){const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent=out||'アクセスログは空です';latest=out;if(bottom)el.scrollTop=el.scrollHeight;}}catch(e){el.textContent=`ログの取得に失敗しました: ${e.message}`;}};
+async function refreshLogs(){const el=document.getElementById('terminal');try{const r=await fetch('/admin/api/access-logs',{cache:'no-store'});if(r.redirected){location.href=r.url;return;}if(!r.ok)throw new Error(`HTTP ${r.status}`);const d=await r.json();const out=d.logs.map(x=>`~ $ ${x.ts}  ${String(x.status).padEnd(3)}  ${x.method.padEnd(6)}  ${x.ip.padEnd(39)}  route=${x.route}  path=${x.path}`).join('\\n');if(out!==latest){const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent=out||'~ $ waiting for requests...';latest=out;if(bottom)el.scrollTop=el.scrollHeight;}}catch(e){el.textContent=`~ $ error: ${e.message}`;}};
 refreshLogs();setInterval(refreshLogs,1500);
 </script>"""
     return base_page(content, "live-logs", "ライブアクセスログ")
@@ -1632,24 +1515,12 @@ def detect_human_face():
         has_face    = face_count > 0
         filename    = None
         ages        = []
+        genders     = []
         age_retry_after = None
         age_error   = None
 
         if has_face:
             target_ip  = ipv4_addr if ipv4_addr != "不明" else ipv6_addr
-            # Run age estimation first so neither disk I/O nor webhook latency
-            # delays the result returned for a detected face.
-            try:
-                ages, age_retry_after = detect_ages(
-                    image_bytes, file.mimetype or "image/jpeg", target_ip
-                )
-            except AgeDetectionError as e:
-                age_error = e.detail
-                app.logger.warning("Face++ request failed: %s", e)
-            except requests.RequestException as e:
-                age_error = "年齢判定サービスに接続できませんでした"
-                app.logger.warning("Face++ connection failed: %s", e)
-
             now_str    = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             ip_for_fn  = target_ip.replace(":","_").replace(" ","_")
             filename   = f"{now_str}_{ip_for_fn}.jpg"
@@ -1658,6 +1529,13 @@ def detect_human_face():
                 image_pil.save(save_path, format="JPEG")
             except Exception as e:
                 print(f"Save error: {e}")
+            else:
+                # age.py consumes the exact file that was just saved.
+                try:
+                    ages, genders, age_retry_after = detect_demographics(save_path, target_ip)
+                except AgeDetectionError as e:
+                    age_error = e.detail
+                    app.logger.warning("age.py failed: %s", e)
 
             if DISCORD_WEBHOOK_URL and "YOUR_DISCORD" not in DISCORD_WEBHOOK_URL:
                 msg = (f"【ログ】顔を検出しました 検出数:{face_count}人 <@&1545839725938483340>\n"
@@ -1671,8 +1549,8 @@ def detect_human_face():
                 except Exception as e:
                     print(f"Discord error: {e}")
 
-        record_traffic(ipv4_addr, ipv6_addr, user_agent, face_count, filename, ages)
-        result = {"human_face": has_face, "face_count": face_count, "ages": ages}
+        record_traffic(ipv4_addr, ipv6_addr, user_agent, face_count, filename, ages, genders)
+        result = {"human_face": has_face, "face_count": face_count, "ages": ages, "genders": genders}
         if age_retry_after is not None:
             result.update({"age_rate_limited": True, "age_retry_after": age_retry_after})
         if age_error:
