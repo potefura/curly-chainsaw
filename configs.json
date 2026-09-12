@@ -1,0 +1,8 @@
+{
+  "edenai_api_key": "",
+  "edenai_provider": "amazon",
+  "age_detection_enabled": false,
+  "api_rate_limit_enabled": false,
+  "api_rate_limit_count": 10,
+  "api_rate_limit_unit": "second"
+}
