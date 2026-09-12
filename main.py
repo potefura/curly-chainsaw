@@ -1368,6 +1368,10 @@ def admin_analytics():
  <div class="card"><div class="card-header"><div class="card-title">性別</div></div><div style="height:280px"><canvas id="genderChart"></canvas></div></div>
 </div>
 <div class="card mb-4">
+  <div class="card-header"><div class="card-title">年齢層</div></div>
+  <div style="height:280px"><canvas id="ageChart"></canvas></div>
+</div>
+<div class="card mb-4">
   <div class="card-header"><div class="card-title">14日間トレンド</div></div>
   <div class="chart-container">
     <canvas id="lineChart"></canvas>
