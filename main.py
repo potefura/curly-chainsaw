@@ -17,6 +17,7 @@ from flask_cors import CORS
 from PIL import Image
 import torch
 from facenet_pytorch import MTCNN
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
@@ -53,6 +54,14 @@ _age_api_lock = threading.Lock()  # Eden AI calls are deliberately smoothed into
 _rate_timestamps = []
 _provider_rate_timestamps = []
 _access_logs = deque(maxlen=5000)
+
+class AgeDetectionError(Exception):
+    """An age provider error safe to expose without leaking credentials."""
+
+    def __init__(self, status_code, detail):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Face++ returned HTTP {status_code}: {detail}")
 
 # ── Cookie 設定 ───────────────────────────────────────────────────────────────
 AUTH_COOKIE   = "ag_auth"
@@ -296,17 +305,37 @@ def detect_ages(image_bytes: bytes, mimetype: str, ip: str):
     allowed, retry_after = _age_request_allowed(ip)
     if not allowed:
         return [], retry_after
+    # Always upload a real JPEG. Browser uploads can be PNG/WebP while carrying
+    # an inaccurate MIME type, which Face++ rejects with HTTP 400.
+    upload_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    upload_image.thumbnail((2048, 2048))
+    upload_buffer = io.BytesIO()
+    upload_image.save(upload_buffer, format="JPEG", quality=90)
     with _age_api_lock:
         _wait_for_api_slot(config)
         response = requests.post(
             "https://api.edenai.run/v2/image/face_detection",
-            headers={"Authorization": f"Bearer {config['edenai_api_key']}"},
+            headers={
+                "Authorization": f"Bearer {config['edenai_api_key']}",
+                "Accept": "application/json",
+            },
             data={"providers": config.get("edenai_provider", "facepp")},
-            files={"file": ("face.jpg", image_bytes, mimetype or "image/jpeg")},
+            files={"file": ("face.jpg", upload_buffer.getvalue(), "image/jpeg")},
             timeout=30,
         )
-    response.raise_for_status()
-    return _extract_ages(response.json()), None
+    if not response.ok:
+        try:
+            error_payload = response.json()
+            detail = error_payload.get("detail", error_payload.get("error", error_payload))
+            detail = json.dumps(detail, ensure_ascii=False) if not isinstance(detail, str) else detail
+        except (ValueError, TypeError):
+            detail = response.text or response.reason
+        raise AgeDetectionError(response.status_code, str(detail)[:500])
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise AgeDetectionError(502, "年齢判定サービスから不正な応答が返されました") from exc
+    return _extract_ages(payload), None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1503,7 +1532,7 @@ def admin_live_logs():
 </div>
 <script>
 let latest='';
-async function refreshLogs(){try{const r=await fetch('/admin/api/access-logs');if(!r.ok)return;const d=await r.json();const out=d.logs.map(x=>`${x.ts}  ${String(x.status).padEnd(3)}  ${x.method.padEnd(6)}  ${x.ip.padEnd(39)}  route=${x.route}  path=${x.path}`).join('\n');if(out!==latest){const el=document.getElementById('terminal');const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent=out||'アクセスログは空です';latest=out;if(bottom)el.scrollTop=el.scrollHeight;}}catch(e){}};
+async function refreshLogs(){const el=document.getElementById('terminal');try{const r=await fetch('/admin/api/access-logs',{cache:'no-store'});if(r.redirected){location.href=r.url;return;}if(!r.ok)throw new Error(`HTTP ${r.status}`);const d=await r.json();const out=d.logs.map(x=>`${x.ts}  ${String(x.status).padEnd(3)}  ${x.method.padEnd(6)}  ${x.ip.padEnd(39)}  route=${x.route}  path=${x.path}`).join('\\n');if(out!==latest){const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent=out||'アクセスログは空です';latest=out;if(bottom)el.scrollTop=el.scrollHeight;}}catch(e){el.textContent=`ログの取得に失敗しました: ${e.message}`;}};
 refreshLogs();setInterval(refreshLogs,1500);
 </script>"""
     return base_page(content, "live-logs", "ライブアクセスログ")
@@ -1550,6 +1579,35 @@ def api_unban():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Error handlers
+# ══════════════════════════════════════════════════════════════════════════════
+def _wants_json_error():
+    return request.path == "/" or request.path.startswith("/admin/api/") or request.is_json
+
+@app.errorhandler(HTTPException)
+def handle_http_error(error):
+    if _wants_json_error():
+        return jsonify({"error": error.name, "message": error.description}), error.code
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>{error.code}</title>
+<style>{BASE_CSS}</style></head><body><div class="login-wrap"><div class="login-box">
+<div class="page-title">{error.code} — {escape(error.name)}</div>
+<p class="page-sub" style="margin:12px 0 20px">{escape(error.description)}</p>
+<a class="btn btn-primary" href="/admin/dashboard">管理画面へ戻る</a>
+</div></div></body></html>""", error.code
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    app.logger.exception("Unhandled request error")
+    if _wants_json_error():
+        return jsonify({"error": "Internal Server Error", "message": "処理中にエラーが発生しました"}), 500
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>500</title>
+<style>{BASE_CSS}</style></head><body><div class="login-wrap"><div class="login-box">
+<div class="page-title">500 — エラー</div><p class="page-sub" style="margin:12px 0 20px">処理中にエラーが発生しました。</p>
+<a class="btn btn-primary" href="/admin/dashboard">管理画面へ戻る</a>
+</div></div></body></html>""", 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  メイン: 顔検出エンドポイント
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/", methods=["POST"])
@@ -1585,9 +1643,12 @@ def detect_human_face():
                 ages, age_retry_after = detect_ages(
                     image_bytes, file.mimetype or "image/jpeg", target_ip
                 )
-            except requests.RequestException as e:
-                age_error = "年齢判定を利用できませんでした"
+            except AgeDetectionError as e:
+                age_error = e.detail
                 app.logger.warning("Face++ request failed: %s", e)
+            except requests.RequestException as e:
+                age_error = "年齢判定サービスに接続できませんでした"
+                app.logger.warning("Face++ connection failed: %s", e)
 
             now_str    = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             ip_for_fn  = target_ip.replace(":","_").replace(" ","_")
@@ -1619,7 +1680,8 @@ def detect_human_face():
         return jsonify(result), 200
 
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        app.logger.exception("Face detection failed")
+        return jsonify({"error": "Face detection failed", "message": "画像を処理できませんでした"}), 500
 
 
 @app.route("/admin")
