@@ -43,7 +43,7 @@ os.makedirs(DATA_DIR,  exist_ok=True)
 
 DEFAULT_CONFIG = {
     "edenai_api_key": "",
-    "edenai_provider": "amazon",
+    "edenai_provider": "facepp",
     "age_detection_enabled": False,
     "api_rate_limit_enabled": False,
     "api_rate_limit_count": 10,
@@ -92,6 +92,9 @@ def load_config() -> dict:
     stored = _load(CONFIG_FILE, {})
     if isinstance(stored, dict):
         config.update(stored)
+    # This integration targets Face++; migrate configurations created with the
+    # former Amazon default without requiring an extra settings-page save.
+    config["edenai_provider"] = "facepp"
     return config
 
 def save_config(config: dict):
@@ -285,7 +288,7 @@ def detect_ages(image_bytes: bytes, mimetype: str, ip: str):
         response = requests.post(
             "https://api.edenai.run/v2/image/face_detection",
             headers={"Authorization": f"Bearer {config['edenai_api_key']}"},
-            data={"providers": config.get("edenai_provider", "amazon")},
+            data={"providers": config.get("edenai_provider", "facepp")},
             files={"file": ("face.jpg", image_bytes, mimetype or "image/jpeg")},
             timeout=30,
         )
@@ -1432,7 +1435,8 @@ def admin_settings():
             config["edenai_api_key"] = key
         if request.form.get("clear_api_key") == "1":
             config["edenai_api_key"] = ""
-        config["edenai_provider"] = request.form.get("edenai_provider", "amazon").strip() or "amazon"
+        # Eden AI uses the provider slug "facepp" for Face++.
+        config["edenai_provider"] = "facepp"
         config["age_detection_enabled"] = request.form.get("age_detection_enabled") == "on"
         config["api_rate_limit_enabled"] = request.form.get("api_rate_limit_enabled") == "on"
         try:
@@ -1453,7 +1457,7 @@ def admin_settings():
 <form method="post"><div class="grid-2">
  <div class="card"><div class="card-header"><div class="card-title">Eden AI 顔年齢判定</div></div>
    <div class="form-group"><label class="form-label">API Key — {masked}</label><input class="input" type="password" name="edenai_api_key" autocomplete="new-password" placeholder="変更する場合のみ入力"></div>
-   <div class="form-group"><label class="form-label">Provider</label><input class="input" name="edenai_provider" value="{escape(str(config['edenai_provider']))}"></div>
+   <div class="form-group"><label class="form-label">Provider</label><input class="input" value="Face++ (facepp)" disabled><input type="hidden" name="edenai_provider" value="facepp"></div>
    <label class="form-label"><input type="checkbox" name="age_detection_enabled" {checked(config['age_detection_enabled'])}> 年齢判定を有効にする</label>
    <label class="form-label" style="margin-top:12px"><input type="checkbox" name="clear_api_key" value="1"> 保存済み API Key を削除</label>
  </div>

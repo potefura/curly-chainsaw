@@ -1,6 +1,6 @@
 {
   "edenai_api_key": "",
-  "edenai_provider": "amazon",
+  "edenai_provider": "facepp",
   "age_detection_enabled": false,
   "api_rate_limit_enabled": false,
   "api_rate_limit_count": 10,
