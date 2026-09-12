@@ -7,7 +7,6 @@ import hashlib
 import functools
 import threading
 import time
-import subprocess
 from html import escape
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -19,6 +18,7 @@ from PIL import Image
 import torch
 from facenet_pytorch import MTCNN
 from werkzeug.exceptions import HTTPException
+from age import BeautyPlusDetector
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
@@ -43,6 +43,8 @@ os.makedirs(DATA_DIR,  exist_ok=True)
 
 _file_lock = threading.RLock()
 _access_logs = deque(maxlen=5000)
+_beautyplus_lock = threading.Lock()
+beautyplus_detector = BeautyPlusDetector()
 
 class AgeDetectionError(Exception):
     """An age provider error safe to expose without leaking credentials."""
@@ -218,47 +220,57 @@ def _age_request_allowed(ip: str):
         return True, 0
 
 def detect_demographics(image_path: str, ip: str):
-    """Run the local age.py helper and parse ``age,gender`` from its output."""
+    """Upload a saved face and obtain its demographics through ``age.py``."""
     allowed, retry_after = _age_request_allowed(ip)
     if not allowed:
         return [], [], retry_after
 
-    script_path = os.environ.get("AGE_SCRIPT_PATH", "/root/age.py")
-    python_cmd = os.environ.get("AGE_PYTHON", "python3")
     absolute_image_path = os.path.abspath(image_path)
 
     for attempt in range(3):
         try:
-            completed = subprocess.run(
-                [python_cmd, script_path, absolute_image_path],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AgeDetectionError(502, f"age.py を実行できませんでした: {exc}") from exc
+            # BeautyPlusDetector owns a curl_cffi session and its cookies. Keep
+            # upload + analysis together so concurrent Flask requests cannot
+            # mutate that shared session while an analysis is in progress.
+            with _beautyplus_lock:
+                cdn_url = beautyplus_detector.upload(absolute_image_path)
+                results = beautyplus_detector.analyze(cdn_url)
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            if "ratelimit" in detail.lower() or "rate limit" in detail.lower():
+                results = "Ratelimit"
+            else:
+                raise AgeDetectionError(502, f"年齢判定に失敗しました: {detail[:300]}") from exc
 
-        output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-        output = output_lines[-1] if output_lines else ""
-        if output.lower() == "ratelimit":
+        if isinstance(results, str) and results.strip().lower() == "ratelimit":
             if attempt < 2:
                 time.sleep(60)
                 continue
             raise AgeDetectionError(429, "年齢判定が3回連続でレート制限されました")
-        if output == "失敗しました":
+        if not results or results == "失敗しました":
             raise AgeDetectionError(502, "年齢判定に失敗しました")
 
-        match = re.fullmatch(r"(\d{1,3})\s*,\s*(male|female)", output, re.IGNORECASE)
-        if completed.returncode == 0 and match:
-            age = int(match.group(1))
-            if age > 120:
-                raise AgeDetectionError(502, "age.py が不正な年齢を返しました")
-            gender = "男性" if match.group(2).lower() == "male" else "女性"
-            return [age], [gender], None
+        if not isinstance(results, (list, tuple)):
+            raise AgeDetectionError(502, "age.py の応答が不正です")
 
-        error = completed.stderr.strip() or output or f"終了コード {completed.returncode}"
-        raise AgeDetectionError(502, f"age.py の応答が不正です: {error[:300]}")
+        ages, genders = [], []
+        for face in results:
+            if not isinstance(face, dict):
+                continue
+            try:
+                age = int(face.get("age"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= age <= 120:
+                continue
+            gender_value = str(face.get("gender", "")).strip().lower()
+            gender = {"male": "男性", "female": "女性"}.get(gender_value)
+            ages.append(age)
+            if gender:
+                genders.append(gender)
+        if not ages:
+            raise AgeDetectionError(502, "age.py から有効な顔データが返されませんでした")
+        return ages, genders, None
 
     raise AgeDetectionError(429, "年齢判定がレート制限されました")
 
