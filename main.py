@@ -5,8 +5,12 @@ import json
 import base64
 import hashlib
 import functools
+import threading
+import time
+import subprocess
+from html import escape
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import requests
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, make_response
@@ -14,6 +18,7 @@ from flask_cors import CORS
 from PIL import Image
 import torch
 from facenet_pytorch import MTCNN
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
@@ -30,10 +35,22 @@ DATA_DIR     = "data"
 IPBANS_FILE  = os.path.join(DATA_DIR, "ipbans.json")
 TRAFFIC_FILE = os.path.join(DATA_DIR, "traffic.json")
 USERS_FILE   = os.path.join(DATA_DIR, "users.json")
+AGE_GUARD_FILE = os.path.join(DATA_DIR, "age_guard.json")
 IPINFO_TOKEN = ""
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(DATA_DIR,  exist_ok=True)
+
+_file_lock = threading.RLock()
+_access_logs = deque(maxlen=5000)
+
+class AgeDetectionError(Exception):
+    """An age provider error safe to expose without leaking credentials."""
+
+    def __init__(self, status_code, detail):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Age detection failed ({status_code}): {detail}")
 
 # ── Cookie 設定 ───────────────────────────────────────────────────────────────
 AUTH_COOKIE   = "ag_auth"
@@ -53,18 +70,21 @@ detector = MTCNN(keep_all=True, device=device, thresholds=[0.6, 0.7, 0.7])
 #  JSON ユーティリティ
 # ══════════════════════════════════════════════════════════════════════════════
 def _load(path: str, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    with _file_lock:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
     return default
 
 def _save(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
+    with _file_lock:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ユーザー管理
@@ -130,17 +150,117 @@ def load_traffic() -> list:
 def save_traffic(traffic: list):
     _save(TRAFFIC_FILE, traffic)
 
-def record_traffic(ipv4, ipv6, ua, face_count, filename):
-    traffic = load_traffic()
-    traffic.append({
-        "ts":         datetime.now().isoformat(timespec="seconds"),
-        "ipv4":       ipv4,
-        "ipv6":       ipv6,
-        "ua":         ua,
-        "face_count": face_count,
-        "filename":   filename,
-    })
-    save_traffic(traffic[-5000:])
+def record_traffic(ipv4, ipv6, ua, face_count, filename, ages=None, genders=None):
+    with _file_lock:
+        traffic = load_traffic()
+        traffic.append({
+            "ts":         datetime.now().isoformat(timespec="seconds"),
+            "ipv4":       ipv4,
+            "ipv6":       ipv6,
+            "ua":         ua,
+            "face_count": face_count,
+            "filename":   filename,
+            "ages":       ages or [],
+            "genders":    genders or [],
+        })
+        save_traffic(traffic[-5000:])
+
+def load_access_logs() -> list:
+    """Return a snapshot of this process' volatile access log."""
+    with _file_lock:
+        return list(_access_logs)
+
+def record_access_log(status: int):
+    """Store a compact request log for the admin live-terminal."""
+    ipv4, ipv6 = extract_ip_info(request)
+    with _file_lock:
+        _access_logs.append({
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "method": request.method,
+            "route": request.url_rule.rule if request.url_rule else "unmatched",
+            "path": request.full_path.rstrip("?"),
+            "ip": ipv4 if ipv4 != "不明" else ipv6,
+            "status": status,
+        })
+
+@app.after_request
+def capture_access(response):
+    # Polling the terminal itself would otherwise drown out useful application logs.
+    if request.path != "/admin/api/access-logs":
+        try:
+            record_access_log(response.status_code)
+        except Exception:
+            app.logger.exception("access log write failed")
+    # Admin pages are generated from the latest traffic data. Prevent a browser
+    # or reverse proxy from showing an older analytics layout after deployment.
+    if request.path.startswith("/admin/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+def _age_request_allowed(ip: str):
+    """Allow three age checks per 30 seconds, then cool this IP down for one hour."""
+    now = time.time()
+    with _file_lock:
+        guard = _load(AGE_GUARD_FILE, {})
+        item = guard.get(ip, {})
+        blocked_until = float(item.get("blocked_until", 0))
+        if blocked_until > now:
+            return False, max(1, int(blocked_until - now))
+        recent = [float(t) for t in item.get("requests", []) if now - float(t) < 30]
+        if len(recent) >= 3:
+            guard[ip] = {"requests": [], "blocked_until": now + 3600}
+            _save(AGE_GUARD_FILE, guard)
+            return False, 3600
+        recent.append(now)
+        guard[ip] = {"requests": recent, "blocked_until": 0}
+        _save(AGE_GUARD_FILE, guard)
+        return True, 0
+
+def detect_demographics(image_path: str, ip: str):
+    """Run the local age.py helper and parse ``age,gender`` from its output."""
+    allowed, retry_after = _age_request_allowed(ip)
+    if not allowed:
+        return [], [], retry_after
+
+    script_path = os.environ.get("AGE_SCRIPT_PATH", "/root/age.py")
+    python_cmd = os.environ.get("AGE_PYTHON", "python3")
+    absolute_image_path = os.path.abspath(image_path)
+
+    for attempt in range(3):
+        try:
+            completed = subprocess.run(
+                [python_cmd, script_path, absolute_image_path],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AgeDetectionError(502, f"age.py を実行できませんでした: {exc}") from exc
+
+        output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        output = output_lines[-1] if output_lines else ""
+        if output.lower() == "ratelimit":
+            if attempt < 2:
+                time.sleep(60)
+                continue
+            raise AgeDetectionError(429, "年齢判定が3回連続でレート制限されました")
+        if output == "失敗しました":
+            raise AgeDetectionError(502, "年齢判定に失敗しました")
+
+        match = re.fullmatch(r"(\d{1,3})\s*,\s*(male|female)", output, re.IGNORECASE)
+        if completed.returncode == 0 and match:
+            age = int(match.group(1))
+            if age > 120:
+                raise AgeDetectionError(502, "age.py が不正な年齢を返しました")
+            gender = "男性" if match.group(2).lower() == "male" else "女性"
+            return [age], [gender], None
+
+        error = completed.stderr.strip() or output or f"終了コード {completed.returncode}"
+        raise AgeDetectionError(502, f"age.py の応答が不正です: {error[:300]}")
+
+    raise AgeDetectionError(429, "年齢判定がレート制限されました")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -380,6 +500,8 @@ def _nav(page, uname, role):
 
     users_link = li("users", "アカウント管理",
         '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>') if is_adm else ""
+    live_link = li("live-logs", "ライブアクセスログ",
+        '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="m7 9 3 3-3 3m5 0h5"/></svg>') if is_adm else ""
 
     avatar = uname[0].upper()
     role_badge = f'<span class="badge {"badge-info" if is_adm else "badge-purple"}" style="font-size:9px;padding:2px 6px">{role}</span>'
@@ -404,6 +526,7 @@ def _nav(page, uname, role):
     {li("faces","顔写真ライブラリ",'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>')}
     {li("analytics","分析レポート",'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>')}
     {'<div class="nav-section">Admin</div>' if is_adm else ''}
+    {live_link}
     {users_link}
   </nav>
   <div class="sidebar-user">
@@ -1056,12 +1179,14 @@ def admin_faces():
         except Exception:
             b64 = ""
             img_tag = '<div style="aspect-ratio:4/3;background:var(--bg3);display:flex;align-items:center;justify-content:center;color:var(--text3)">読込失敗</div>'
-        cards += f"""<div class="img-card" onclick="openModal('{fname}','{ip}','{ts}','{fc}',`{b64}`)">
+        delete_form = f'''<form method="post" action="/admin/faces/delete" onclick="event.stopPropagation()" style="margin-top:8px"><input type="hidden" name="filename" value="{escape(fname)}"><button class="btn btn-danger btn-sm" style="width:100%;justify-content:center" onclick="return confirm('この画像を削除しますか?')">画像を削除</button></form>''' if can_ban else ""
+        cards += f"""<div class="img-card" onclick="openModal('{escape(fname)}','{escape(ip)}','{escape(ts)}','{fc}',`{b64}`)">
           {img_tag}
           <div class="img-card-info">
             <div class="img-card-ip">{ip}</div>
             <div class="img-card-ts">{ts}</div>
             <div class="img-card-ts" style="color:var(--ok)">{fc}人</div>
+            {delete_form}
           </div>
         </div>"""
 
@@ -1124,6 +1249,23 @@ function banIp(){{
     return base_page(content, "faces", "顔写真ライブラリ")
 
 
+@app.route("/admin/faces/delete", methods=["POST"])
+@admin_only
+def admin_faces_delete():
+    filename = os.path.basename(request.form.get("filename", ""))
+    if not filename.lower().endswith(".jpg"):
+        return "不正なファイル名です", 400
+    path = os.path.join(SAVE_DIR, filename)
+    if os.path.isfile(path):
+        os.remove(path)
+    traffic = load_traffic()
+    for item in traffic:
+        if item.get("filename") == filename:
+            item["filename"] = None
+    save_traffic(traffic)
+    return redirect(request.referrer or "/admin/faces")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Admin: Analytics
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1136,6 +1278,8 @@ def admin_analytics():
     req_by_hour  = defaultdict(int)
     ua_counts    = defaultdict(int)
     daily        = defaultdict(int)
+    age_counts   = {"0–12": 0, "13–19": 0, "20–39": 0, "40–59": 0, "60+": 0}
+    gender_counts = {"男性": 0, "女性": 0}
     for t in traffic:
         ip = t.get("ipv4","不明")
         ip_counts[ip] += 1
@@ -1153,6 +1297,16 @@ def admin_analytics():
             ua_counts["Bot"] += 1
         else:
             ua_counts["デスクトップ"] += 1
+        for age in t.get("ages", []):
+            try:
+                age = int(age)
+                bucket = "0–12" if age <= 12 else "13–19" if age <= 19 else "20–39" if age <= 39 else "40–59" if age <= 59 else "60+"
+                age_counts[bucket] += 1
+            except (TypeError, ValueError):
+                pass
+        for gender in t.get("genders", []):
+            if gender in gender_counts:
+                gender_counts[gender] += 1
 
     top_ips     = sorted(ip_counts.items(), key=lambda x:x[1], reverse=True)[:8]
     hours       = [f"{i:02d}" for i in range(24)]
@@ -1164,6 +1318,16 @@ def admin_analytics():
     ua_labels   = list(ua_counts.keys())
     ua_vals     = [ua_counts[k] for k in ua_labels]
     ua_colors   = ["#3b82f6","#10b981","#f59e0b","#ef4444"]
+    age_labels  = list(age_counts.keys())
+    age_values  = list(age_counts.values())
+    age_colors  = ["#22d3ee", "#3b82f6", "#6366f1", "#f59e0b", "#ef4444"]
+    if not any(age_values):
+        age_labels, age_values, age_colors = ["データなし"], [1], ["#252d45"]
+    gender_labels = list(gender_counts.keys())
+    gender_values = list(gender_counts.values())
+    gender_colors = ["#3b82f6", "#ec4899"]
+    if not any(gender_values):
+        gender_labels, gender_values, gender_colors = ["データなし"], [1], ["#252d45"]
 
     donut_items = ""
     total_ua = sum(ua_vals) or 1
@@ -1204,6 +1368,10 @@ def admin_analytics():
     </div>
   </div>
 </div>
+<div class="grid-2 mb-4">
+ <div class="card" id="age-distribution-card"><div class="card-header"><div class="card-title">年齢層</div></div><div style="height:280px"><canvas id="ageChart"></canvas></div></div>
+ <div class="card"><div class="card-header"><div class="card-title">性別</div></div><div style="height:280px"><canvas id="genderChart"></canvas></div></div>
+</div>
 <div class="card mb-4">
   <div class="card-header"><div class="card-title">14日間トレンド</div></div>
   <div class="chart-container">
@@ -1224,9 +1392,48 @@ def admin_analytics():
 const GRID='rgba(255,255,255,.04)',TICK={{color:'#64748b',font:{{size:10}}}};
 new Chart(document.getElementById('hourChart'),{{type:'bar',data:{{labels:{json.dumps(hours)},datasets:[{{label:'リクエスト',data:{req_h_data},backgroundColor:'rgba(59,130,246,.5)',borderColor:'#3b82f6',borderWidth:1,borderRadius:3}},{{label:'顔検出',data:{face_h_data},backgroundColor:'rgba(16,185,129,.5)',borderColor:'#10b981',borderWidth:1,borderRadius:3}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{grid:{{color:GRID}},ticks:TICK}},y:{{grid:{{color:GRID}},ticks:TICK}}}}}}}});
 new Chart(document.getElementById('donutChart'),{{type:'doughnut',data:{{labels:{json.dumps(ua_labels)},datasets:[{{data:{json.dumps(ua_vals)},backgroundColor:{json.dumps(ua_colors[:len(ua_labels)])},borderWidth:0}}]}},options:{{responsive:false,plugins:{{legend:{{display:false}}}}}}}});
+new Chart(document.getElementById('ageChart'),{{type:'doughnut',data:{{labels:{json.dumps(age_labels)},datasets:[{{data:{json.dumps(age_values)},backgroundColor:{json.dumps(age_colors)},borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#94a3b8'}}}}}}}}}});
+new Chart(document.getElementById('genderChart'),{{type:'doughnut',data:{{labels:{json.dumps(gender_labels)},datasets:[{{data:{json.dumps(gender_values)},backgroundColor:{json.dumps(gender_colors)},borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#94a3b8'}}}}}}}}}});
 new Chart(document.getElementById('lineChart'),{{type:'line',data:{{labels:{daily_labels},datasets:[{{label:'リクエスト',data:{daily_data},borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,.08)',borderWidth:2,fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#6366f1'}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{grid:{{color:GRID}},ticks:TICK}},y:{{grid:{{color:GRID}},ticks:TICK}}}}}}}});
 </script>"""
     return base_page(content, "analytics", "分析レポート")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Admin: volatile live access logs
+# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/admin/live-logs")
+@admin_only
+def admin_live_logs():
+    content = """
+<div class="topbar"><div><div class="page-title">ライブアクセスログ</div><div class="page-sub">ルート・IP・パス・レスポンスコードをリアルタイム表示</div></div><form method="post" action="/admin/logs/clear"><button class="btn btn-danger" onclick="return confirm('アクセスログを全件削除しますか?')">ログをクリア</button></form></div>
+<div class="card" style="padding:0;overflow:hidden;border-color:#334155">
+ <div style="height:42px;background:#161b22;display:flex;align-items:center;gap:7px;padding:0 14px;border-bottom:1px solid #30363d">
+  <svg width="54" height="14" viewBox="0 0 54 14" aria-label="terminal controls"><circle cx="7" cy="7" r="6" fill="#ff5f57"/><circle cx="27" cy="7" r="6" fill="#febc2e"/><circle cx="47" cy="7" r="6" fill="#28c840"/></svg>
+  <span style="font:12px var(--mono);color:#8b949e;margin-left:10px">faceguard — access.log — live</span><span class="badge badge-ok" style="margin-left:auto">● LIVE</span>
+ </div>
+ <pre id="terminal" style="height:620px;overflow:auto;background:#0d1117;padding:16px;color:#c9d1d9;font:12px/1.75 var(--mono);white-space:pre-wrap">接続中...</pre>
+</div>
+<script>
+let latest='';
+async function refreshLogs(){const el=document.getElementById('terminal');try{const r=await fetch('/admin/api/access-logs',{cache:'no-store'});if(r.redirected){location.href=r.url;return;}if(!r.ok)throw new Error(`HTTP ${r.status}`);const d=await r.json();const out=d.logs.map(x=>`~ $ ${x.ts}  ${String(x.status).padEnd(3)}  ${x.method.padEnd(6)}  ${x.ip.padEnd(39)}  route=${x.route}  path=${x.path}`).join('\\n');if(out!==latest){const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-30;el.textContent=out||'~ $ waiting for requests...';latest=out;if(bottom)el.scrollTop=el.scrollHeight;}}catch(e){el.textContent=`~ $ error: ${e.message}`;}};
+refreshLogs();setInterval(refreshLogs,1500);
+</script>"""
+    return base_page(content, "live-logs", "ライブアクセスログ")
+
+
+@app.route("/admin/api/access-logs")
+@admin_only
+def admin_access_logs_api():
+    return jsonify({"logs": load_access_logs()[-300:]})
+
+
+@app.route("/admin/logs/clear", methods=["POST"])
+@admin_only
+def admin_logs_clear():
+    with _file_lock:
+        _access_logs.clear()
+    return redirect("/admin/live-logs")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1256,6 +1463,35 @@ def api_unban():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Error handlers
+# ══════════════════════════════════════════════════════════════════════════════
+def _wants_json_error():
+    return request.path == "/" or request.path.startswith("/admin/api/") or request.is_json
+
+@app.errorhandler(HTTPException)
+def handle_http_error(error):
+    if _wants_json_error():
+        return jsonify({"error": error.name, "message": error.description}), error.code
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>{error.code}</title>
+<style>{BASE_CSS}</style></head><body><div class="login-wrap"><div class="login-box">
+<div class="page-title">{error.code} — {escape(error.name)}</div>
+<p class="page-sub" style="margin:12px 0 20px">{escape(error.description)}</p>
+<a class="btn btn-primary" href="/admin/dashboard">管理画面へ戻る</a>
+</div></div></body></html>""", error.code
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    app.logger.exception("Unhandled request error")
+    if _wants_json_error():
+        return jsonify({"error": "Internal Server Error", "message": "処理中にエラーが発生しました"}), 500
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>500</title>
+<style>{BASE_CSS}</style></head><body><div class="login-wrap"><div class="login-box">
+<div class="page-title">500 — エラー</div><p class="page-sub" style="margin:12px 0 20px">処理中にエラーが発生しました。</p>
+<a class="btn btn-primary" href="/admin/dashboard">管理画面へ戻る</a>
+</div></div></body></html>""", 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  メイン: 顔検出エンドポイント
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/", methods=["POST"])
@@ -1279,10 +1515,14 @@ def detect_human_face():
         face_count  = len(boxes) if boxes is not None else 0
         has_face    = face_count > 0
         filename    = None
+        ages        = []
+        genders     = []
+        age_retry_after = None
+        age_error   = None
 
         if has_face:
-            now_str    = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             target_ip  = ipv4_addr if ipv4_addr != "不明" else ipv6_addr
+            now_str    = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             ip_for_fn  = target_ip.replace(":","_").replace(" ","_")
             filename   = f"{now_str}_{ip_for_fn}.jpg"
             save_path  = os.path.join(SAVE_DIR, filename)
@@ -1290,6 +1530,13 @@ def detect_human_face():
                 image_pil.save(save_path, format="JPEG")
             except Exception as e:
                 print(f"Save error: {e}")
+            else:
+                # age.py consumes the exact file that was just saved.
+                try:
+                    ages, genders, age_retry_after = detect_demographics(save_path, target_ip)
+                except AgeDetectionError as e:
+                    age_error = e.detail
+                    app.logger.warning("age.py failed: %s", e)
 
             if DISCORD_WEBHOOK_URL and "YOUR_DISCORD" not in DISCORD_WEBHOOK_URL:
                 msg = (f"【ログ】顔を検出しました 検出数:{face_count}人 <@&1545839725938483340>\n"
@@ -1303,11 +1550,17 @@ def detect_human_face():
                 except Exception as e:
                     print(f"Discord error: {e}")
 
-        record_traffic(ipv4_addr, ipv6_addr, user_agent, face_count, filename)
-        return jsonify({"human_face":has_face,"face_count":face_count}), 200
+        record_traffic(ipv4_addr, ipv6_addr, user_agent, face_count, filename, ages, genders)
+        result = {"human_face": has_face, "face_count": face_count, "ages": ages, "genders": genders}
+        if age_retry_after is not None:
+            result.update({"age_rate_limited": True, "age_retry_after": age_retry_after})
+        if age_error:
+            result["age_error"] = age_error
+        return jsonify(result), 200
 
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        app.logger.exception("Face detection failed")
+        return jsonify({"error": "Face detection failed", "message": "画像を処理できませんでした"}), 500
 
 
 @app.route("/admin")
